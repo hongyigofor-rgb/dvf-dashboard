@@ -1,0 +1,123 @@
+# DVF-PRO 雲端自動更新：抓資料 → 遮蔽 → 部署 GitHub Pages（不依賴 Mac 開機）
+# 排程時間為 UTC；台北時間 = UTC+8。GitHub 排程在尖峰時段可能延遲數分鐘到十幾分鐘，偶爾會略過一次。
+name: dvf-update
+
+on:
+  schedule:
+    - cron: '*/5 1-5 * * 1-5'   # 盤中：台北 09:00–13:55，每 5 分鐘抓 TWSE MIS 即時報價
+    - cron: '20 7 * * 1-5'      # 盤後：台北 15:20 完整掃描
+    - cron: '30 9 * * 1-5'      # 盤後補跑：台北 17:30（15:20 被延遲或失敗時）
+  push:
+    branches: [main]            # 程式更新後立即重新部署
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: 'publish＝只重建網頁｜intraday＝抓即時報價｜daily＝完整盤後掃描'
+        type: choice
+        options: [publish, intraday, daily]
+        default: publish
+
+permissions:
+  contents: write    # 推送 state 分支（最新掃描結果與集保週資料）
+  pages: write
+  id-token: write
+
+concurrency:
+  group: dvf-update
+  cancel-in-progress: false
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    timeout-minutes: 150
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+    env:
+      PYTHONIOENCODING: utf-8
+      FINMIND_TOKEN: ${{ secrets.FINMIND_TOKEN }}     # 選填
+      CORE_POSITIONS: ${{ secrets.CORE_POSITIONS }}   # 選填：代號:目標價:成本（網頁上會遮蔽）
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Decide mode
+        id: mode
+        run: |
+          case "${{ github.event_name }}|${{ github.event.schedule }}" in
+            "schedule|*/5 1-5 * * 1-5") m=intraday ;;
+            schedule\|*) m=daily ;;
+            workflow_dispatch\|*) m="${{ inputs.mode }}" ;;
+            *) m=publish ;;
+          esac
+          echo "mode=$m" >> "$GITHUB_OUTPUT"
+          echo "MODE=$m"
+
+      - name: Restore state (state branch)
+        run: |
+          if git fetch -q --depth=1 origin state; then
+            git --work-tree=. checkout FETCH_HEAD -- . && git reset -q
+            python -c "import json;d=json.load(open('candidates.json'));print('state data_date', d.get('data_date'), 'generated_at', d.get('generated_at'))"
+          else
+            echo "::error::找不到 state 分支（請先在 Mac 執行 sync_cloud.py --state）"; exit 1
+          fi
+
+      - name: Live snapshot (TWSE MIS)
+        id: live
+        run: |
+          python intraday_monitor.py --once --no-notify --no-sync --no-publish
+          python - >> "$GITHUB_OUTPUT" <<'PY'
+          import json, datetime as dt
+          d = json.load(open("live_quotes.json"))
+          today = dt.datetime.now(dt.timezone(dt.timedelta(hours=8))).date().isoformat()
+          print("session_today=" + ("true" if d.get("session_date") == today else "false"))
+          print("session=" + str(d.get("session_date")))
+          PY
+
+      - name: After-close scan
+        id: scan
+        if: steps.mode.outputs.mode == 'daily' && steps.live.outputs.session_today == 'true'
+        run: |
+          dd=$(python -c "import json;print(json.load(open('candidates.json')).get('data_date') or '')")
+          if [ "$dd" = "$(TZ=Asia/Taipei date +%F)" ] && [ "${{ github.event_name }}" = "schedule" ]; then
+            echo "已有今日（$dd）掃描結果，略過"; exit 0
+          fi
+          python scanner.py --no-briefing --wait-fresh 60
+          python intraday_monitor.py --once --no-notify --no-sync --no-publish
+          echo "scanned=true" >> "$GITHUB_OUTPUT"
+
+      - name: Save state
+        if: steps.scan.outputs.scanned == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          rm -rf /tmp/state && mkdir -p /tmp/state/cache
+          cp candidates.json /tmp/state/
+          if [ -d cache/tdcc ]; then cp -r cache/tdcc /tmp/state/cache/; fi
+          python -c "import pathlib, publish_site as P; P.assert_clean(pathlib.Path('/tmp/state'), P.env_secrets())"
+          cd /tmp/state && git init -q -b state && git add -A
+          git -c user.name="DVF-PRO Bot" -c user.email="dvf-pro-bot@users.noreply.github.com" commit -qm "state $(TZ=Asia/Taipei date '+%F %T')"
+          git push -qf "https://x-access-token:${GH_TOKEN}@github.com/${{ github.repository }}.git" state
+
+      - name: Build site (redacted)
+        id: build
+        run: |
+          python publish_site.py --out public
+          deploy=true
+          if [ "${{ steps.mode.outputs.mode }}" = "intraday" ] && [ "${{ steps.live.outputs.session_today }}" != "true" ]; then
+            echo "今日無交易（MIS 場次 ${{ steps.live.outputs.session }}），不重新部署"; deploy=false
+          fi
+          echo "deploy=$deploy" >> "$GITHUB_OUTPUT"
+
+      - if: steps.build.outputs.deploy == 'true'
+        uses: actions/configure-pages@v5
+      - if: steps.build.outputs.deploy == 'true'
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: public
+      - if: steps.build.outputs.deploy == 'true'
+        id: deploy
+        uses: actions/deploy-pages@v4

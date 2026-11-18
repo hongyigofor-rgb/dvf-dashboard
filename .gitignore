@@ -1,0 +1,12 @@
+.env
+candidates.json
+candidates.js
+live_quotes.json
+live_quotes.js
+.live_alert_sent_*.json
+broker_blacklist.json
+broker_data/
+cache/
+logs/
+public/
+__pycache__/
