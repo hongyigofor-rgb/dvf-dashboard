@@ -32,15 +32,15 @@ jobs:
     timeout-minutes: 150
     environment:
       name: github-pages
-      url: ${{ steps.deploy.outputs.page_url }}
+      url: ${{ steps.deploy_try.outputs.page_url || steps.deploy_retry.outputs.page_url }}
     env:
       PYTHONIOENCODING: utf-8
       FINMIND_TOKEN: ${{ secrets.FINMIND_TOKEN }}     # 選填
       CORE_POSITIONS: ${{ secrets.CORE_POSITIONS }}   # 選填：代號:目標價:成本（網頁上會遮蔽）
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: '3.12'
 
@@ -113,11 +113,20 @@ jobs:
           echo "deploy=$deploy" >> "$GITHUB_OUTPUT"
 
       - if: steps.build.outputs.deploy == 'true'
-        uses: actions/configure-pages@v5
+        uses: actions/configure-pages@v6
       - if: steps.build.outputs.deploy == 'true'
-        uses: actions/upload-pages-artifact@v3
+        uses: actions/upload-pages-artifact@v5
         with:
           path: public
+          include-hidden-files: true   # 保留 .nojekyll
+      # deploy-pages 偶爾在上傳後立即查不到 github-pages artifact（"Fetching artifact metadata failed"），
+      # 第一次失敗就等 30 秒再部署一次。
       - if: steps.build.outputs.deploy == 'true'
-        id: deploy
-        uses: actions/deploy-pages@v4
+        id: deploy_try
+        continue-on-error: true
+        uses: actions/deploy-pages@v5
+      - if: steps.build.outputs.deploy == 'true' && steps.deploy_try.outcome == 'failure'
+        run: sleep 30
+      - if: steps.build.outputs.deploy == 'true' && steps.deploy_try.outcome == 'failure'
+        id: deploy_retry
+        uses: actions/deploy-pages@v5
